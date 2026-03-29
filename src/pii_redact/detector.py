@@ -30,12 +30,18 @@ class LineData:
     words: list[WordBox]
     text: str
     spans: list[tuple[int, int]]
+    rect: fitz.Rect
 
 
 LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "name": (
+        re.compile(r"\bemployer(?:'|’)?s name\b", re.IGNORECASE),
+        re.compile(r"\bname of employer\b", re.IGNORECASE),
+        re.compile(r"\bemployee(?:'|’)?s first name and initial\b", re.IGNORECASE),
+        re.compile(r"\bname of proprietor\b", re.IGNORECASE),
+        re.compile(r"\bemployer(?:'|’)?s name, address, and ZIP code\b", re.IGNORECASE),
         re.compile(r"\bemployee name\b", re.IGNORECASE),
-        re.compile(r"\bemployee'?s first name and (?:middle )?initial\b", re.IGNORECASE),
+        re.compile(r"\bemployee(?:'|’)?s first name and (?:middle )?initial\b", re.IGNORECASE),
         re.compile(r"\bfirst name(?: and (?:middle )?initial)?\b", re.IGNORECASE),
         re.compile(r"\blast name\b", re.IGNORECASE),
         re.compile(r"\bmiddle initial\b", re.IGNORECASE),
@@ -45,23 +51,29 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\baggregation name\b", re.IGNORECASE),
         re.compile(r"\bname of (?:person|business|company|trade|aggregation)\b", re.IGNORECASE),
         re.compile(r"\bfull name\b", re.IGNORECASE),
-        re.compile(r"^name$", re.IGNORECASE),
     ),
     "address": (
+        re.compile(r"\bemployer(?:'|’)?s name, address, and ZIP code\b", re.IGNORECASE),
+        re.compile(r"\bemployer(?:'|’)?s address\b", re.IGNORECASE),
         re.compile(r"\bemployee address\b", re.IGNORECASE),
         re.compile(r"\bphysical address\b", re.IGNORECASE),
         re.compile(r"\bmailing address\b", re.IGNORECASE),
         re.compile(r"\bhome address\b", re.IGNORECASE),
+        re.compile(r"\bapt\.? no\.?\b", re.IGNORECASE),
+        re.compile(r"\bcity, town(?:,? or post office)?\b", re.IGNORECASE),
+        re.compile(r"\bcity, state, and ZIP code\b", re.IGNORECASE),
+        re.compile(r"\bcity, town or post office, state, and ZIP code\b", re.IGNORECASE),
         re.compile(r"\bstreet address\b", re.IGNORECASE),
     ),
     "zip": (
+        re.compile(r"\bemployer(?:'|’)?s name, address, and ZIP code\b", re.IGNORECASE),
         re.compile(r"\bzip code\b", re.IGNORECASE),
         re.compile(r"\bpostal code\b", re.IGNORECASE),
         re.compile(r"\bzip\b", re.IGNORECASE),
     ),
     "state_id": (
-        re.compile(r"\bemployer'?s state id number\b", re.IGNORECASE),
-        re.compile(r"\bpayer'?s state (?:no|number)\b", re.IGNORECASE),
+        re.compile(r"\bemployer(?:'|’)?s state id number\b", re.IGNORECASE),
+        re.compile(r"\bpayer(?:'|’)?s state (?:no|number)\b", re.IGNORECASE),
         re.compile(r"\bstate id number\b", re.IGNORECASE),
         re.compile(r"\bstate id\b", re.IGNORECASE),
         re.compile(r"\bstate no\b", re.IGNORECASE),
@@ -70,9 +82,20 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\bcontrol number\b", re.IGNORECASE),
     ),
 }
+COLUMN_HEADER_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "name": (re.compile(r"^name$", re.IGNORECASE),),
+    "control_number": (re.compile(r"^control number$", re.IGNORECASE),),
+    "state_id": (
+        re.compile(r"^employer state id number$", re.IGNORECASE),
+        re.compile(r"^payer'?s state (?:no|number)\.?$", re.IGNORECASE),
+    ),
+    "zip": (re.compile(r"^zip(?: code)?$", re.IGNORECASE),),
+    "ssn": (re.compile(r"^ssn$", re.IGNORECASE),),
+    "ein": (re.compile(r"^ein$", re.IGNORECASE),),
+}
 
 EIN_HINT_PATTERN = re.compile(
-    r"\b(?:ein|tin|employer(?:'s)? (?:id|identification) number|federal id)\b",
+    r"\b(?:ein|tin|employer(?:(?:'|’)s)? (?:id|identification) number|federal id)\b",
     re.IGNORECASE,
 )
 STREET_ADDRESS_PATTERN = re.compile(
@@ -82,7 +105,7 @@ STREET_ADDRESS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CITY_STATE_ZIP_PATTERN = re.compile(
-    r"\b[A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"
+    r"\b[A-Za-z][A-Za-z .'-]+,?\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"
 )
 DIRECT_PATTERN_TYPES = {"ssn", "ein", "email", "phone"}
 FIELD_COLUMN_TYPES = {"name", "address", "zip", "state_id", "control_number", "ein", "ssn"}
@@ -154,6 +177,7 @@ def detect_pii(
     detections.extend(_detect_word_level(words, pii_types, source))
     detections.extend(_detect_line_patterns(lines, pii_types, source))
     detections.extend(_detect_labeled_fields(lines, pii_types, source))
+    detections.extend(_detect_column_header_fields(lines, pii_types, source))
     detections.extend(_detect_address_lines(lines, pii_types, source))
     detections.extend(_detect_split_numeric_fields(lines, pii_types, source))
     return _dedupe_detections(detections)
@@ -230,7 +254,6 @@ def _detect_labeled_fields(
                     label_rect = _union_rect(word.rect for word in label_words)
                     value_groups = _candidate_value_groups(
                         lines,
-                        line_index,
                         label_rect,
                         label_words,
                         pii_type,
@@ -276,6 +299,33 @@ def _detect_address_lines(
     return detections
 
 
+def _detect_column_header_fields(
+    lines: list[LineData],
+    pii_types: list[str],
+    source: str,
+) -> list[Detection]:
+    detections: list[Detection] = []
+    for line in lines:
+        for pii_type in pii_types:
+            for pattern in COLUMN_HEADER_PATTERNS.get(pii_type, ()):
+                if not pattern.fullmatch(line.text.strip()):
+                    continue
+                groups = _column_value_groups(lines, line.rect, pii_type)
+                for matched_words in groups:
+                    trimmed_words = _trim_labeled_value_words(matched_words, pii_type)
+                    if not trimmed_words or not _looks_like_value(trimmed_words, pii_type):
+                        continue
+                    detections.append(
+                        Detection(
+                            pii_type=pii_type,
+                            value=" ".join(word.text for word in trimmed_words),
+                            rect=_union_rect(word.rect for word in trimmed_words),
+                            source=source,
+                        )
+                    )
+    return detections
+
+
 def _trim_labeled_value_words(words: list[WordBox], pii_type: str) -> list[WordBox]:
     trimmed = list(words)
     if pii_type == "zip":
@@ -304,7 +354,6 @@ def _detect_split_numeric_fields(
             detections.extend(
                 _scan_digit_sequences(
                     lines,
-                    line_index,
                     line,
                     source=source,
                     pii_type="ssn",
@@ -317,7 +366,6 @@ def _detect_split_numeric_fields(
             detections.extend(
                 _scan_digit_sequences(
                     lines,
-                    line_index,
                     line,
                     source=source,
                     pii_type="ein",
@@ -331,7 +379,6 @@ def _detect_split_numeric_fields(
 
 def _scan_digit_sequences(
     lines: list[LineData],
-    line_index: int,
     line: LineData,
     source: str,
     pii_type: str,
@@ -361,9 +408,9 @@ def _scan_digit_sequences(
                 if tuple(lengths) in valid_partitions or (
                     pii_type == "ein" and len(selected) > 1 and all(len(word.text) == 1 for word in selected)
                 ):
-                    if pii_type == "ein" and not _supports_ein_context(lines, line_index, line, selected):
+                    if pii_type == "ein" and not _supports_ein_context(lines, line, selected):
                         break
-                    if pii_type == "ssn" and not _supports_ssn_context(lines, line_index, line, selected):
+                    if pii_type == "ssn" and not _supports_ssn_context(lines, line, selected):
                         break
                     detections.append(
                         Detection(
@@ -398,7 +445,15 @@ def _build_lines(words: list[WordBox]) -> list[LineData]:
             parts.append(word.text)
             cursor += len(word.text)
             spans.append((start, cursor))
-        lines.append(LineData(key=sorted_words[0].line_key, words=sorted_words, text="".join(parts), spans=spans))
+        lines.append(
+            LineData(
+                key=sorted_words[0].line_key,
+                words=sorted_words,
+                text="".join(parts),
+                spans=spans,
+                rect=_union_rect(word.rect for word in sorted_words),
+            )
+        )
     return lines
 
 
@@ -453,7 +508,6 @@ def _dedupe_detections(detections: list[Detection]) -> list[Detection]:
 
 def _candidate_value_groups(
     lines: list[LineData],
-    line_index: int,
     label_rect: fitz.Rect,
     label_words: list[WordBox],
     pii_type: str,
@@ -461,10 +515,15 @@ def _candidate_value_groups(
     next_label_start: int,
 ) -> list[list[WordBox]]:
     groups: list[list[WordBox]] = []
-    groups.extend(_same_line_value_groups(lines[line_index], label_words, pii_type, label_end, next_label_start))
-    groups.extend(_below_label_value_groups(lines, line_index, label_rect, pii_type))
-    groups.extend(_column_value_groups(lines, line_index, label_rect, pii_type))
-    return _dedupe_word_groups(groups)
+    label_line = next((line for line in lines if any(word in line.words for word in label_words)), None)
+    if label_line is not None:
+        groups.extend(_same_line_value_groups(label_line, label_words, pii_type, label_end, next_label_start))
+    groups.extend(_below_label_value_groups(lines, label_rect, pii_type))
+    groups.extend(_column_value_groups(lines, label_rect, pii_type))
+    split_groups: list[list[WordBox]] = []
+    for group in groups:
+        split_groups.extend(_split_word_group(group, pii_type))
+    return _dedupe_word_groups(split_groups)
 
 
 def _same_line_value_groups(
@@ -483,16 +542,27 @@ def _same_line_value_groups(
 
 def _below_label_value_groups(
     lines: list[LineData],
-    line_index: int,
     label_rect: fitz.Rect,
     pii_type: str,
 ) -> list[list[WordBox]]:
     groups: list[list[WordBox]] = []
-    x_min = label_rect.x0 - 12
-    x_max = max(label_rect.x1 + 220, label_rect.x0 + 140)
-    for next_line in lines[line_index + 1 : line_index + 1 + ROW_VALUE_SCAN_LIMIT]:
-        if next_line.words[0].rect.y0 - label_rect.y1 > 36:
-            break
+    x_min, x_max = _horizontal_window(label_rect, pii_type)
+    candidate_lines = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.y0 >= label_rect.y0 + 2
+            and ((line.rect.y0 + line.rect.y1) / 2) > ((label_rect.y0 + label_rect.y1) / 2)
+            and line.rect.y0 - label_rect.y0 <= 90
+            and line.rect.x1 >= x_min
+            and line.rect.x0 <= x_max
+        ),
+        key=lambda line: (line.rect.y0, line.rect.x0),
+    )
+    accepted_groups = 0
+    for next_line in candidate_lines:
+        if _line_looks_like_header(next_line.text):
+            continue
         candidate_words = [
             word
             for word in next_line.words
@@ -501,28 +571,34 @@ def _below_label_value_groups(
         candidate_words = _trim_labeled_value_words(candidate_words, pii_type)
         if candidate_words:
             groups.append(candidate_words)
-            if pii_type not in {"address", "name"}:
+            accepted_groups += 1
+            if accepted_groups >= ROW_VALUE_SCAN_LIMIT:
                 break
     return groups
 
 
 def _column_value_groups(
     lines: list[LineData],
-    line_index: int,
     label_rect: fitz.Rect,
     pii_type: str,
 ) -> list[list[WordBox]]:
     if pii_type not in FIELD_COLUMN_TYPES:
         return []
-    if not _line_is_column_header(lines[line_index].text):
+    header_line = next((line for line in lines if line.rect.intersects(label_rect)), None)
+    if header_line is None or not _line_is_column_header(header_line.text):
         return []
 
     groups: list[list[WordBox]] = []
-    x_min = label_rect.x0 - 4
-    x_max = max(label_rect.x1 + 80, label_rect.x0 + 110)
-    for next_line in lines[line_index + 1 :]:
-        if next_line.words[0].rect.y0 - label_rect.y1 > 120:
-            break
+    x_min, x_max = _horizontal_window(label_rect, pii_type, column_mode=True)
+    candidate_lines = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.y0 > label_rect.y1 and line.rect.y0 - label_rect.y1 <= 140
+        ),
+        key=lambda line: (line.rect.y0, line.rect.x0),
+    )
+    for next_line in candidate_lines:
         if _line_looks_like_header(next_line.text):
             break
         candidate_words = [
@@ -578,23 +654,21 @@ def _next_label_start(text: str, start: int) -> int:
 
 def _supports_ein_context(
     lines: list[LineData],
-    line_index: int,
     line: LineData,
     selected: list[WordBox],
 ) -> bool:
-    if EIN_HINT_PATTERN.search(_nearby_context(lines, line_index, line, selected)):
+    if EIN_HINT_PATTERN.search(_nearby_context(lines, line, selected)):
         return True
     return False
 
 
 def _supports_ssn_context(
     lines: list[LineData],
-    line_index: int,
     line: LineData,
     selected: list[WordBox],
 ) -> bool:
     return bool(
-        re.search(r"\bssn|social security\b", _nearby_context(lines, line_index, line, selected), re.IGNORECASE)
+        re.search(r"\bssn|social security\b", _nearby_context(lines, line, selected), re.IGNORECASE)
     )
 
 
@@ -634,6 +708,38 @@ def _looks_like_label_word(text: str) -> bool:
     }
 
 
+def _split_word_group(words: list[WordBox], pii_type: str) -> list[list[WordBox]]:
+    if len(words) <= 1 or pii_type == "address":
+        return [words]
+    sorted_words = sorted(words, key=lambda word: (word.rect.y0, word.rect.x0))
+    groups: list[list[WordBox]] = [[sorted_words[0]]]
+    for word in sorted_words[1:]:
+        prev = groups[-1][-1]
+        gap = word.rect.x0 - prev.rect.x1
+        if gap > 35:
+            groups.append([word])
+        else:
+            groups[-1].append(word)
+    return groups
+
+
+def _horizontal_window(label_rect: fitz.Rect, pii_type: str, column_mode: bool = False) -> tuple[float, float]:
+    x_min = label_rect.x0 - 12
+    width = label_rect.x1 - label_rect.x0
+    if pii_type == "control_number":
+        margin = 200 if column_mode else 260
+    elif pii_type == "state_id":
+        margin = 140 if column_mode else 180
+    elif pii_type == "address":
+        margin = 120 if column_mode else 140
+    elif pii_type == "name":
+        margin = 70 if column_mode else 90
+    else:
+        margin = 80 if column_mode else 100
+    x_max = max(label_rect.x1 + margin, label_rect.x0 + width + 40)
+    return x_min, x_max
+
+
 def _looks_like_value(words: list[WordBox], pii_type: str) -> bool:
     if not words:
         return False
@@ -648,7 +754,7 @@ def _looks_like_value(words: list[WordBox], pii_type: str) -> bool:
         alpha_tokens = [word.text for word in words if re.search(r"[A-Za-z]", word.text)]
         if not alpha_tokens or len(alpha_tokens) > 6:
             return False
-        if any(re.search(r"\d", token) for token in alpha_tokens):
+        if any(re.search(r"\d", word.text) for word in words):
             return False
         if len(alpha_tokens) == 1:
             token = alpha_tokens[0].strip(".,")
@@ -668,17 +774,38 @@ def _looks_like_value(words: list[WordBox], pii_type: str) -> bool:
                 any(word.text.lower().strip(".,") in ADDRESS_HINT_WORDS for word in words)
                 and any(re.search(r"\d", word.text) for word in words)
             )
+            or (
+                len(words) <= 4
+                and any(word.text[:1].isupper() for word in words if word.text)
+                and not any(token in lowered for token in ("instructions", "attach", "complete", "line", "part"))
+            )
         )
 
     if pii_type == "zip":
         return any(PII_PATTERNS["zip"].fullmatch(word.text) for word in words)
 
-    if pii_type in {"state_id", "control_number"}:
+    if pii_type == "control_number":
+        compact = re.sub(r"\s+", "", text)
+        return (
+            bool(re.search(r"\d", text))
+            and len(words) <= 4
+            and len(text) <= 24
+            and len(compact) >= 5
+            and bool(re.search(r"[A-Za-z-]", text))
+            and lowered not in {"w-2", "w-3"}
+            and "for" not in lowered
+            and not re.fullmatch(r"\d+[—-][a-z]+", lowered)
+        )
+
+    if pii_type == "state_id":
         return (
             bool(re.search(r"\d", text))
             and len(words) <= 4
             and len(text) <= 24
             and bool(re.search(r"[A-Za-z-]", text))
+            and lowered not in {"w-2", "w-3"}
+            and "for" not in lowered
+            and not re.fullmatch(r"\d+[—-][a-z]+", lowered)
         )
 
     return True
@@ -714,7 +841,6 @@ def _direct_match_context(lines: list[LineData], line_index: int) -> str:
 
 def _nearby_context(
     lines: list[LineData],
-    line_index: int,
     line: LineData,
     selected: list[WordBox],
 ) -> str:
@@ -726,8 +852,13 @@ def _nearby_context(
             if id(word) not in selected_ids and word.rect.x1 <= selected[0].rect.x0 + 2
         )
     ]
-    for previous_line in lines[max(0, line_index - 2) : line_index]:
-        if line.words[0].rect.y0 - previous_line.words[0].rect.y0 > 48:
-            continue
-        parts.append(previous_line.text)
+    nearby_above = sorted(
+        (
+            other
+            for other in lines
+            if other.rect.y1 <= line.rect.y0 and line.rect.y0 - other.rect.y1 <= 60
+        ),
+        key=lambda other: (line.rect.y0 - other.rect.y1, abs(other.rect.x0 - line.rect.x0)),
+    )
+    parts.extend(other.text for other in nearby_above[:3])
     return " ".join(part for part in parts if part)
