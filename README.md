@@ -12,8 +12,10 @@ Offline CLI tool to securely redact PII from PDF tax-like documents using Python
 
 ## Installation
 
+Recommended Python version: `3.10`
+
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
 ```
