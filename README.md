@@ -5,8 +5,8 @@ Offline CLI tool to securely redact PII from PDF tax-like documents using Python
 ## Features
 
 - Secure PDF redaction using PyMuPDF `add_redact_annot` plus `apply_redactions`
-- Regex-based detection for `ssn`, `ein`, `email`, and `phone`
-- Word-level extraction with line reconstruction to catch multi-token matches
+- Default redaction coverage for names, addresses, ZIP codes, SSNs, EINs/TINs, employer state IDs, W-2 control numbers, emails, and phone numbers
+- Word-level extraction with line reconstruction to catch multi-token matches, including split SSN and EIN fields
 - Optional OCR fallback for scanned pages using `pdf2image` and `pytesseract`
 - Local-only processing with no external API calls
 
@@ -30,12 +30,12 @@ OCR fallback also requires native tools:
 ```bash
 pii-redact input.pdf --output out.pdf
 pii-redact input.pdf --output out.pdf --types ssn,email,phone --ocr-fallback
-pii-redact input.pdf --output out.pdf --types ein
+pii-redact input.pdf --output out.pdf --types name,address,zip,state_id,control_number
 ```
 
 Defaults:
 
-- PII types: `ssn,email,phone`
+- PII types: all supported types
 - OCR fallback: disabled
 
 ## Development

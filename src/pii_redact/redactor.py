@@ -38,6 +38,8 @@ def redact_pdf(
     normalized_types = normalize_pii_types(pii_types)
 
     pages: list[PageResult] = []
+    fitz.TOOLS.mupdf_display_errors(False)
+    fitz.TOOLS.mupdf_display_warnings(False)
     with fitz.open(input_path) as document:
         for page_number, page in enumerate(document):
             word_boxes = extract_page_words(page)
@@ -61,9 +63,8 @@ def redact_pdf(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         document.save(
             output_path,
-            garbage=4,
+            garbage=3,
             deflate=True,
-            clean=True,
         )
 
     return RedactionResult(output_path=output_path, pages=pages)
