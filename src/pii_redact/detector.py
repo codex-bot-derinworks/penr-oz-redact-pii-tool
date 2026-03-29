@@ -25,6 +25,12 @@ class Detection:
 
 
 @dataclass(frozen=True)
+class WidgetDetection:
+    detection: Detection
+    xref: int
+
+
+@dataclass(frozen=True)
 class LineData:
     key: tuple[int, int]
     words: list[WordBox]
@@ -181,6 +187,43 @@ def detect_pii(
     detections.extend(_detect_address_lines(lines, pii_types, source))
     detections.extend(_detect_split_numeric_fields(lines, pii_types, source))
     return _dedupe_detections(detections)
+
+
+def detect_direct_text_pii(
+    word_boxes: Iterable[WordBox],
+    pii_types: list[str],
+    source: str,
+) -> list[Detection]:
+    words = list(word_boxes)
+    lines = _build_lines(words)
+    detections: list[Detection] = []
+    detections.extend(_detect_word_level(words, pii_types, source))
+    detections.extend(_detect_line_patterns(lines, pii_types, source))
+    return _dedupe_detections(detections)
+
+
+def detect_widget_pii(page: fitz.Page, pii_types: list[str]) -> list[WidgetDetection]:
+    lines = _build_lines(extract_page_words(page))
+    results: list[WidgetDetection] = []
+    for widget in list(page.widgets() or []):
+        value = str(widget.field_value or "").strip()
+        if not value or value in {"Off", "Yes", "No"}:
+            continue
+        pii_type = _classify_widget_value(value, widget.rect, lines, widget.field_name or "", pii_types)
+        if not pii_type:
+            continue
+        results.append(
+            WidgetDetection(
+                detection=Detection(
+                    pii_type=pii_type,
+                    value=value,
+                    rect=fitz.Rect(widget.rect),
+                    source="widget",
+                ),
+                xref=widget.xref,
+            )
+        )
+    return results
 
 
 def _detect_word_level(
@@ -809,6 +852,118 @@ def _looks_like_value(words: list[WordBox], pii_type: str) -> bool:
         )
 
     return True
+
+
+def _classify_widget_value(
+    value: str,
+    rect: fitz.Rect,
+    lines: list[LineData],
+    field_name: str,
+    pii_types: list[str],
+) -> str | None:
+    lowered_field = field_name.lower()
+    context = _widget_context(lines, rect).lower()
+    compact_digits = re.sub(r"\D", "", value)
+
+    if "ssn" in pii_types and "table_dependents" in lowered_field and len(compact_digits) == 9:
+        return "ssn"
+
+    if "ssn" in pii_types and (
+        "social security" in context
+        or re.search(r"\bssn\b", context)
+        or "ssn" in lowered_field
+    ):
+        if len(compact_digits) == 9:
+            return "ssn"
+
+    if "ein" in pii_types and (
+        EIN_HINT_PATTERN.search(context) or "ein" in lowered_field
+    ):
+        if len(compact_digits) == 9:
+            return "ein"
+
+    if "control_number" in pii_types and "control number" in context:
+        return "control_number" if _looks_like_widget_value(value, "control_number") else None
+
+    if "state_id" in pii_types and re.search(r"(state id|state no|payer.?s state)", context):
+        return "state_id" if _looks_like_widget_value(value, "state_id") else None
+
+    if "zip" in pii_types and ("zip" in context or "postal code" in context):
+        return "zip" if _looks_like_widget_value(value, "zip") else None
+
+    if "address" in pii_types and re.search(r"(address|apt|city|town|post office|home)", context):
+        return "address" if _looks_like_widget_value(value, "address") else None
+
+    if "name" in pii_types and (
+        re.search(r"(first name|last name|middle initial|dependent|name of proprietor|employer.?s name|full name|name)", context)
+        or "dependents_readorder" in lowered_field
+        or "table_dependents" in lowered_field
+    ):
+        return "name" if _looks_like_widget_value(value, "name") else None
+
+    return None
+
+
+def _looks_like_widget_value(value: str, pii_type: str) -> bool:
+    stripped = value.strip()
+    lowered = stripped.lower()
+    compact = re.sub(r"\s+", "", stripped)
+    if not stripped:
+        return False
+    if pii_type == "ssn":
+        return len(re.sub(r"\D", "", stripped)) == 9
+    if pii_type == "ein":
+        return len(re.sub(r"\D", "", stripped)) == 9
+    if pii_type == "zip":
+        return bool(PII_PATTERNS["zip"].fullmatch(stripped))
+    if pii_type == "state_id":
+        return len(compact) >= 4 and bool(re.search(r"\d", stripped))
+    if pii_type == "control_number":
+        return len(compact) >= 5 and bool(re.search(r"[A-Za-z]", stripped)) and bool(re.search(r"\d", stripped))
+    if pii_type == "address":
+        return bool(
+            STREET_ADDRESS_PATTERN.search(stripped)
+            or CITY_STATE_ZIP_PATTERN.search(stripped)
+            or len(compact) >= 3
+        )
+    if pii_type == "name":
+        parts = [part for part in stripped.split() if part]
+        if not parts or len(parts) > 6:
+            return False
+        if any(re.search(r"\d", part) for part in parts):
+            return False
+        return all(part[0].isalpha() for part in parts if part)
+    return True
+
+
+def _widget_context(lines: list[LineData], rect: fitz.Rect) -> str:
+    context_lines: list[str] = []
+    nearby = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.x1 >= rect.x0 - 24
+            and line.rect.x0 <= rect.x1 + 24
+            and line.rect.y1 <= rect.y0 + 6
+            and rect.y0 - line.rect.y1 <= 48
+        ),
+        key=lambda line: (rect.y0 - line.rect.y1, abs(line.rect.x0 - rect.x0)),
+    )
+    context_lines.extend(line.text for line in nearby[:4])
+
+    left_neighbors = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.y1 >= rect.y0 - 6
+            and line.rect.y0 <= rect.y1 + 6
+            and line.rect.x1 <= rect.x0 + 12
+            and rect.x0 - line.rect.x1 <= 220
+        ),
+        key=lambda line: (rect.x0 - line.rect.x1, abs(line.rect.y0 - rect.y0)),
+    )
+    context_lines.extend(line.text for line in left_neighbors[:3])
+    return " ".join(context_lines)
 
 
 def _allow_direct_match(line_text: str, pii_type: str) -> bool:

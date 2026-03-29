@@ -5,7 +5,7 @@ from pathlib import Path
 
 import fitz
 
-from .detector import Detection, detect_pii, extract_page_words
+from .detector import Detection, detect_direct_text_pii, detect_pii, detect_widget_pii, extract_page_words
 from .ocr import extract_ocr_words
 from .patterns import normalize_pii_types
 
@@ -43,8 +43,17 @@ def redact_pdf(
     with fitz.open(input_path) as document:
         for page_number, page in enumerate(document):
             word_boxes = extract_page_words(page)
+            page_widgets = list(page.widgets() or [])
+            widget_detections = detect_widget_pii(page, normalized_types)
+            widget_xrefs = {item.xref for item in widget_detections}
             source = "text"
-            if word_boxes:
+            if widget_detections:
+                source = "widget"
+                detections = [item.detection for item in widget_detections]
+            elif page_widgets:
+                direct_types = [pii_type for pii_type in normalized_types if pii_type in {"ssn", "ein", "email", "phone"}]
+                detections = detect_direct_text_pii(word_boxes, direct_types, source)
+            elif word_boxes:
                 detections = detect_pii(word_boxes, normalized_types, source)
             elif ocr_fallback:
                 source = "ocr"
@@ -57,6 +66,10 @@ def redact_pdf(
                 page.add_redact_annot(detection.rect, fill=(0, 0, 0))
             if detections:
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            if widget_xrefs:
+                for widget in list(page.widgets() or []):
+                    if widget.xref in widget_xrefs:
+                        page.delete_widget(widget)
 
             pages.append(PageResult(page_number=page_number, source=source, detections=detections))
 
