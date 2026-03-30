@@ -153,6 +153,23 @@ NAME_STOPWORDS = {
     "name",
     "phone",
 }
+WIDGET_NAME_CONTEXT_PATTERN = re.compile(
+    r"(name\(s\) shown|shown on return|first name|last name|middle initial|dependent|"
+    r"name of proprietor|employer.?s name|employee.?s first name|employee.?s name|"
+    r"payer.?s name|recipient.?s name|trade, business, or aggregation name|"
+    r"company name|trade name|business name|aggregation name|full name)",
+    re.IGNORECASE,
+)
+WIDGET_ADDRESS_CONTEXT_PATTERN = re.compile(
+    r"(address|street|city|town|zip|postal code|apt|physical address|"
+    r"employee.?s address|employer.?s name, address, and zip code|"
+    r"payer.?s name, street address|recipient.?s name|name, street address)",
+    re.IGNORECASE,
+)
+WIDGET_STATE_ID_CONTEXT_PATTERN = re.compile(
+    r"(state id|state no|payer.?s state|employer.?s state)",
+    re.IGNORECASE,
+)
 
 
 def extract_page_words(page: fitz.Page) -> list[WordBox]:
@@ -862,44 +879,63 @@ def _classify_widget_value(
     pii_types: list[str],
 ) -> str | None:
     lowered_field = field_name.lower()
-    context = _widget_context(lines, rect).lower()
+    context = _widget_context(lines, rect)
+    lowered_context = context.lower()
+    combined_context = f"{lowered_field} {lowered_context}"
     compact_digits = re.sub(r"\D", "", value)
 
     if "ssn" in pii_types and "table_dependents" in lowered_field and len(compact_digits) == 9:
         return "ssn"
 
     if "ssn" in pii_types and (
-        "social security" in context
-        or re.search(r"\bssn\b", context)
+        "social security" in combined_context
+        or re.search(r"\bssn\b", combined_context)
         or "ssn" in lowered_field
     ):
         if len(compact_digits) == 9:
             return "ssn"
 
     if "ein" in pii_types and (
-        EIN_HINT_PATTERN.search(context) or "ein" in lowered_field
+        EIN_HINT_PATTERN.search(combined_context) or "ein" in lowered_field
     ):
         if len(compact_digits) == 9:
             return "ein"
 
-    if "control_number" in pii_types and "control number" in context:
-        return "control_number" if _looks_like_widget_value(value, "control_number") else None
+    if "control_number" in pii_types and "control number" in combined_context:
+        if _looks_like_widget_value(value, "control_number"):
+            return "control_number"
 
-    if "state_id" in pii_types and re.search(r"(state id|state no|payer.?s state)", context):
-        return "state_id" if _looks_like_widget_value(value, "state_id") else None
+    if "state_id" in pii_types and (
+        WIDGET_STATE_ID_CONTEXT_PATTERN.search(combined_context)
+        or "boxes15_readorder" in lowered_field
+    ):
+        if _looks_like_widget_value(value, "state_id"):
+            return "state_id"
 
-    if "zip" in pii_types and ("zip" in context or "postal code" in context):
-        return "zip" if _looks_like_widget_value(value, "zip") else None
+    if "zip" in pii_types and ("zip" in combined_context or "postal code" in combined_context):
+        if _looks_like_widget_value(value, "zip"):
+            return "zip"
 
-    if "address" in pii_types and re.search(r"(address|apt|city|town|post office|home)", context):
-        return "address" if _looks_like_widget_value(value, "address") else None
+    if "address" in pii_types and (
+        WIDGET_ADDRESS_CONTEXT_PATTERN.search(combined_context)
+        or "table_line1a" in lowered_field
+        or (
+            rect.height >= 24
+            and re.search(r"(employer|employee|payer|recipient)", combined_context)
+        )
+    ):
+        if _looks_like_widget_value(value, "address"):
+            return "address"
 
     if "name" in pii_types and (
-        re.search(r"(first name|last name|middle initial|dependent|name of proprietor|employer.?s name|full name|name)", context)
+        WIDGET_NAME_CONTEXT_PATTERN.search(combined_context)
+        or ("table_parti" in lowered_field and rect.x0 < 340)
+        or any(token in lowered_field for token in ("firstname", "lastname", "middle"))
         or "dependents_readorder" in lowered_field
         or "table_dependents" in lowered_field
     ):
-        return "name" if _looks_like_widget_value(value, "name") else None
+        if _looks_like_widget_value(value, "name"):
+            return "name"
 
     return None
 
@@ -919,20 +955,30 @@ def _looks_like_widget_value(value: str, pii_type: str) -> bool:
     if pii_type == "state_id":
         return len(compact) >= 4 and bool(re.search(r"\d", stripped))
     if pii_type == "control_number":
-        return len(compact) >= 5 and bool(re.search(r"[A-Za-z]", stripped)) and bool(re.search(r"\d", stripped))
+        return len(compact) >= 4 and bool(re.search(r"\d", stripped))
     if pii_type == "address":
         return bool(
             STREET_ADDRESS_PATTERN.search(stripped)
             or CITY_STATE_ZIP_PATTERN.search(stripped)
+            or "\n" in stripped
+            or "," in stripped
             or len(compact) >= 3
         )
     if pii_type == "name":
-        parts = [part for part in stripped.split() if part]
-        if not parts or len(parts) > 6:
+        parts = [
+            part
+            for part in re.split(r"\s+", stripped.replace("\n", " ").strip())
+            if part and part not in {"&", "/", "and"}
+        ]
+        if not parts or len(parts) > 10:
             return False
         if any(re.search(r"\d", part) for part in parts):
             return False
-        return all(part[0].isalpha() for part in parts if part)
+        return all(
+            bool(re.match(r"[A-Za-z]", part.strip(".,'()/-")))
+            or part.strip(".,").lower() in COMPANY_SUFFIXES
+            for part in parts
+        )
     return True
 
 
@@ -963,6 +1009,36 @@ def _widget_context(lines: list[LineData], rect: fitz.Rect) -> str:
         key=lambda line: (rect.x0 - line.rect.x1, abs(line.rect.y0 - rect.y0)),
     )
     context_lines.extend(line.text for line in left_neighbors[:3])
+
+    same_row_neighbors = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.y1 >= rect.y0 - 10
+            and line.rect.y0 <= rect.y1 + 10
+            and line.rect.x1 >= rect.x0 - 280
+            and line.rect.x0 <= rect.x1 + 280
+            and not line.rect.intersects(rect)
+        ),
+        key=lambda line: (
+            min(abs(line.rect.x0 - rect.x1), abs(rect.x0 - line.rect.x1)),
+            abs(((line.rect.y0 + line.rect.y1) / 2) - ((rect.y0 + rect.y1) / 2)),
+        ),
+    )
+    context_lines.extend(line.text for line in same_row_neighbors[:4])
+
+    below_neighbors = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.x1 >= rect.x0 - 40
+            and line.rect.x0 <= rect.x1 + 40
+            and line.rect.y0 >= rect.y1 - 2
+            and line.rect.y0 - rect.y1 <= 36
+        ),
+        key=lambda line: (line.rect.y0 - rect.y1, abs(line.rect.x0 - rect.x0)),
+    )
+    context_lines.extend(line.text for line in below_neighbors[:2])
     return " ".join(context_lines)
 
 

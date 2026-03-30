@@ -4,7 +4,13 @@ from pathlib import Path
 
 import fitz
 
-from pii_redact.detector import detect_pii, extract_page_words
+from pii_redact.detector import (
+    _build_lines,
+    _classify_widget_value,
+    _looks_like_widget_value,
+    detect_pii,
+    extract_page_words,
+)
 from pii_redact.redactor import redact_pdf
 
 
@@ -206,3 +212,45 @@ def test_redact_pdf_redacts_values_under_pii_table_headers(tmp_path: Path) -> No
         assert "Jane Public" not in text
         assert "W2-4455" not in text
         assert "Form 1040 Title" in text
+
+
+def test_widget_value_allows_joint_names_and_numeric_control_numbers() -> None:
+    assert _looks_like_widget_value("John Doe & Betty Doe", "name")
+    assert _looks_like_widget_value("778899001", "control_number")
+
+
+def test_widget_classification_prefers_name_over_nearby_control_label() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "d Control number", fontsize=12)
+    page.insert_text((72, 96), "e Employee's first name and initial", fontsize=12)
+
+    lines = _build_lines(extract_page_words(page))
+    pii_type = _classify_widget_value(
+        "John Doe & Betty Doe",
+        fitz.Rect(72, 110, 210, 122),
+        lines,
+        "FirstName_ReadOrder",
+        ["name", "address", "zip", "state_id", "control_number"],
+    )
+    document.close()
+
+    assert pii_type == "name"
+
+
+def test_widget_classification_prefers_address_over_nearby_zip_label() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Physical address of each property (street, city, state, ZIP code)", fontsize=12)
+
+    lines = _build_lines(extract_page_words(page))
+    pii_type = _classify_widget_value(
+        "123 Main Street, Sometown, CA 01234",
+        fitz.Rect(72, 86, 360, 98),
+        lines,
+        "Table_Line1a.RowA",
+        ["name", "address", "zip", "state_id", "control_number"],
+    )
+    document.close()
+
+    assert pii_type == "address"
