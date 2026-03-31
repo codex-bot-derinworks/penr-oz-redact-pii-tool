@@ -41,6 +41,10 @@ class LineData:
 
 LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "name": (
+        re.compile(r"\bname\(s\) shown on (?:form|your tax return|return)\b", re.IGNORECASE),
+        re.compile(r"\bname of person with self-employment income\b", re.IGNORECASE),
+        re.compile(r"\brecipient(?:'|’)?s name\b", re.IGNORECASE),
+        re.compile(r"\bpayer(?:'|’)?s name\b", re.IGNORECASE),
         re.compile(r"\bemployer(?:'|’)?s name\b", re.IGNORECASE),
         re.compile(r"\bname of employer\b", re.IGNORECASE),
         re.compile(r"\bemployee(?:'|’)?s first name and initial\b", re.IGNORECASE),
@@ -89,19 +93,27 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     ),
 }
 COLUMN_HEADER_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
-    "name": (re.compile(r"^name$", re.IGNORECASE),),
+    "name": (
+        re.compile(r"^name$", re.IGNORECASE),
+        re.compile(r"^\(\d+\)\s+first name(?: and (?:middle )?initial)?$", re.IGNORECASE),
+        re.compile(r"^\(\d+\)\s+last name$", re.IGNORECASE),
+        re.compile(r"^\(\d+\)\s+middle initial$", re.IGNORECASE),
+    ),
     "control_number": (re.compile(r"^control number$", re.IGNORECASE),),
     "state_id": (
         re.compile(r"^employer state id number$", re.IGNORECASE),
         re.compile(r"^payer'?s state (?:no|number)\.?$", re.IGNORECASE),
     ),
     "zip": (re.compile(r"^zip(?: code)?$", re.IGNORECASE),),
-    "ssn": (re.compile(r"^ssn$", re.IGNORECASE),),
+    "ssn": (
+        re.compile(r"^ssn$", re.IGNORECASE),
+        re.compile(r"^\(\d+\)\s+ssn$", re.IGNORECASE),
+    ),
     "ein": (re.compile(r"^ein$", re.IGNORECASE),),
 }
 
 EIN_HINT_PATTERN = re.compile(
-    r"\b(?:ein|tin|employer(?:(?:'|’)s)? (?:id|identification) number|federal id)\b",
+    r"\b(?:ein|tin|identifying number|employer(?:(?:'|’)s)? (?:id|identification) number|federal id)\b",
     re.IGNORECASE,
 )
 STREET_ADDRESS_PATTERN = re.compile(
@@ -156,6 +168,7 @@ NAME_STOPWORDS = {
 WIDGET_NAME_CONTEXT_PATTERN = re.compile(
     r"(name\(s\) shown|shown on return|first name|last name|middle initial|dependent|"
     r"name of proprietor|employer.?s name|employee.?s first name|employee.?s name|"
+    r"name of person with self-employment income|"
     r"payer.?s name|recipient.?s name|trade, business, or aggregation name|"
     r"company name|trade name|business name|aggregation name|full name)",
     re.IGNORECASE,
@@ -434,6 +447,26 @@ def _detect_split_numeric_fields(
                     require_hint=False,
                 )
             )
+    if "ssn" in pii_types:
+        detections.extend(
+            _scan_row_digit_sequences(
+                lines,
+                source=source,
+                pii_type="ssn",
+                target_length=9,
+                valid_partitions={(3, 2, 4)},
+            )
+        )
+    if "ein" in pii_types:
+        detections.extend(
+            _scan_row_digit_sequences(
+                lines,
+                source=source,
+                pii_type="ein",
+                target_length=9,
+                valid_partitions={(2, 7)},
+            )
+        )
     return detections
 
 
@@ -466,7 +499,7 @@ def _scan_digit_sequences(
             expected += 1
             if total == target_length:
                 if tuple(lengths) in valid_partitions or (
-                    pii_type == "ein" and len(selected) > 1 and all(len(word.text) == 1 for word in selected)
+                    pii_type in {"ssn", "ein"} and len(selected) > 1 and all(len(word.text) == 1 for word in selected)
                 ):
                     if pii_type == "ein" and not _supports_ein_context(lines, line, selected):
                         break
@@ -483,6 +516,73 @@ def _scan_digit_sequences(
                 break
             if total > target_length:
                 break
+    return detections
+
+
+def _scan_row_digit_sequences(
+    lines: list[LineData],
+    source: str,
+    pii_type: str,
+    target_length: int,
+    valid_partitions: set[tuple[int, ...]],
+) -> list[Detection]:
+    digit_lines = sorted(
+        (
+            line
+            for line in lines
+            if len(line.words) == 1 and line.text.isdigit()
+        ),
+        key=lambda line: (line.rect.y0, line.rect.x0),
+    )
+    if not digit_lines:
+        return []
+
+    rows: list[list[LineData]] = [[digit_lines[0]]]
+    for line in digit_lines[1:]:
+        prev = rows[-1][-1]
+        same_row = abs(line.rect.y0 - prev.rect.y0) <= 2 and abs(line.rect.y1 - prev.rect.y1) <= 2
+        if same_row:
+            rows[-1].append(line)
+        else:
+            rows.append([line])
+
+    detections: list[Detection] = []
+    for row in rows:
+        row = sorted(row, key=lambda line: line.rect.x0)
+        for start_index in range(len(row)):
+            selected: list[LineData] = []
+            lengths: list[int] = []
+            total = 0
+            prev_x1: float | None = None
+            for candidate in row[start_index:]:
+                if prev_x1 is not None and candidate.rect.x0 - prev_x1 > 20:
+                    break
+                selected.append(candidate)
+                lengths.append(len(candidate.text))
+                total += len(candidate.text)
+                prev_x1 = candidate.rect.x1
+                if total == target_length:
+                    if tuple(lengths) in valid_partitions or (
+                        pii_type in {"ssn", "ein"} and all(len(item.text) == 1 for item in selected)
+                    ):
+                        selected_words = [item.words[0] for item in selected]
+                        if pii_type == "ein":
+                            if not EIN_HINT_PATTERN.search(_nearby_rect_context(lines, _union_rect(item.rect for item in selected))):
+                                break
+                        if pii_type == "ssn":
+                            if not re.search(r"\bssn|social security\b", _nearby_rect_context(lines, _union_rect(item.rect for item in selected)), re.IGNORECASE):
+                                break
+                        detections.append(
+                            Detection(
+                                pii_type=pii_type,
+                                value="".join(item.text for item in selected),
+                                rect=_union_rect(word.rect for word in selected_words),
+                                source=source,
+                            )
+                        )
+                    break
+                if total > target_length:
+                    break
     return detections
 
 
@@ -578,6 +678,7 @@ def _candidate_value_groups(
     label_line = next((line for line in lines if any(word in line.words for word in label_words)), None)
     if label_line is not None:
         groups.extend(_same_line_value_groups(label_line, label_words, pii_type, label_end, next_label_start))
+    groups.extend(_right_of_label_value_groups(lines, label_rect, pii_type))
     groups.extend(_below_label_value_groups(lines, label_rect, pii_type))
     groups.extend(_column_value_groups(lines, label_rect, pii_type))
     split_groups: list[list[WordBox]] = []
@@ -597,6 +698,36 @@ def _same_line_value_groups(
     after_label = _words_covering_span(line, _skip_separators(line.text, label_end), next_label_start)
     if after_label:
         groups.append(after_label)
+    return groups
+
+
+def _right_of_label_value_groups(
+    lines: list[LineData],
+    label_rect: fitz.Rect,
+    pii_type: str,
+) -> list[list[WordBox]]:
+    groups: list[list[WordBox]] = []
+    x_min, x_max = _horizontal_window(label_rect, pii_type)
+    label_mid_y = (label_rect.y0 + label_rect.y1) / 2
+    candidate_lines = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.x0 >= label_rect.x1 + 2
+            and line.rect.x0 <= x_max
+            and abs(((line.rect.y0 + line.rect.y1) / 2) - label_mid_y) <= 14
+        ),
+        key=lambda line: (line.rect.x0, line.rect.y0),
+    )
+    for candidate_line in candidate_lines:
+        candidate_words = [
+            word
+            for word in candidate_line.words
+            if x_min <= _word_center_x(word) <= x_max
+        ]
+        candidate_words = _trim_labeled_value_words(candidate_words, pii_type)
+        if candidate_words:
+            groups.append(candidate_words)
     return groups
 
 
@@ -890,6 +1021,8 @@ def _classify_widget_value(
     if "ssn" in pii_types and (
         "social security" in combined_context
         or re.search(r"\bssn\b", combined_context)
+        or "identifying number" in combined_context
+        or "taxpayer identification number" in combined_context
         or "ssn" in lowered_field
     ):
         if len(compact_digits) == 9:
@@ -1093,3 +1226,22 @@ def _nearby_context(
     )
     parts.extend(other.text for other in nearby_above[:3])
     return " ".join(part for part in parts if part)
+
+
+def _nearby_rect_context(lines: list[LineData], rect: fitz.Rect) -> str:
+    nearby = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.x1 >= rect.x0 - 260
+            and line.rect.x0 <= rect.x1 + 40
+            and line.rect.y0 >= rect.y0 - 60
+            and line.rect.y1 <= rect.y1 + 20
+            and not line.rect.intersects(rect)
+        ),
+        key=lambda line: (
+            abs(((line.rect.y0 + line.rect.y1) / 2) - ((rect.y0 + rect.y1) / 2)),
+            abs(line.rect.x0 - rect.x0),
+        ),
+    )
+    return " ".join(line.text for line in nearby[:8])

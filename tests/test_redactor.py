@@ -254,3 +254,109 @@ def test_widget_classification_prefers_address_over_nearby_zip_label() -> None:
     document.close()
 
     assert pii_type == "address"
+
+
+def test_redact_pdf_redacts_printed_names_shown_and_ssn(tmp_path: Path) -> None:
+    source = tmp_path / "printed-names.pdf"
+    output = tmp_path / "printed-names-redacted.pdf"
+    _make_text_pdf(
+        source,
+        "\n".join(
+            [
+                "Name(s) shown on Form 1040, 1040-SR, or 1040-NR",
+                "J OHN H DOE & BETTY DOE",
+                "Your social security number",
+                "111-22-3333",
+            ]
+        ),
+    )
+
+    redact_pdf(source, output)
+
+    with fitz.open(output) as redacted_doc:
+        text = "\n".join(page.get_text() for page in redacted_doc)
+        assert "J OHN H DOE & BETTY DOE" not in text
+        assert "111-22-3333" not in text
+
+
+def test_redact_pdf_redacts_printed_dependent_name_and_ssn_columns(tmp_path: Path) -> None:
+    source = tmp_path / "printed-dependent.pdf"
+    output = tmp_path / "printed-dependent-redacted.pdf"
+    _make_text_pdf(
+        source,
+        "\n".join(
+            [
+                "Dependents",
+                "(1) First name",
+                "SMALL",
+                "(2) Last name",
+                "DOE",
+                "(3) SSN",
+                "3 3 3 4 4 5 5 5 5",
+            ]
+        ),
+    )
+
+    redact_pdf(source, output)
+
+    with fitz.open(output) as redacted_doc:
+        text = "\n".join(page.get_text() for page in redacted_doc)
+        assert "SMALL" not in text
+        assert "DOE" not in text
+        assert "3 3 3 4 4 5 5 5 5" not in text
+
+
+def test_redact_pdf_redacts_printed_recipient_name(tmp_path: Path) -> None:
+    source = tmp_path / "printed-1099r.pdf"
+    output = tmp_path / "printed-1099r-redacted.pdf"
+    _make_text_pdf(
+        source,
+        "\n".join(
+            [
+                "RECIPIENT'S name",
+                "J OHN H DOE",
+            ]
+        ),
+    )
+
+    redact_pdf(source, output)
+
+    with fitz.open(output) as redacted_doc:
+        text = "\n".join(page.get_text() for page in redacted_doc)
+        assert "J OHN H DOE" not in text
+
+
+def test_widget_classification_redacts_identifying_number_as_ssn() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Identifying number", fontsize=12)
+
+    lines = _build_lines(extract_page_words(page))
+    pii_type = _classify_widget_value(
+        "111223333",
+        fitz.Rect(72, 86, 180, 98),
+        lines,
+        "f1_3",
+        ["name", "address", "zip", "ssn", "ein", "state_id", "control_number"],
+    )
+    document.close()
+
+    assert pii_type == "ssn"
+
+
+def test_widget_classification_redacts_taxpayer_identification_number_as_ssn() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Your taxpayer identification number", fontsize=12)
+
+    lines = _build_lines(extract_page_words(page))
+    pii_type = _classify_widget_value(
+        "111223333",
+        fitz.Rect(72, 86, 180, 98),
+        lines,
+        "f1_2",
+        ["name", "address", "zip", "ssn", "ein", "state_id", "control_number"],
+    )
+    document.close()
+
+    assert pii_type == "ssn"
