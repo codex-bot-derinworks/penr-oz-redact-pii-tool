@@ -59,6 +59,7 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\btrade name\b", re.IGNORECASE),
         re.compile(r"\bbusiness name\b", re.IGNORECASE),
         re.compile(r"\baggregation name\b", re.IGNORECASE),
+        re.compile(r"\bschedule c\s*:", re.IGNORECASE),
         re.compile(r"\bname of (?:person|business|company|trade|aggregation)\b", re.IGNORECASE),
         re.compile(r"\bfull name\b", re.IGNORECASE),
     ),
@@ -170,6 +171,7 @@ WIDGET_NAME_CONTEXT_PATTERN = re.compile(
     r"name of proprietor|employer.?s name|employee.?s first name|employee.?s name|"
     r"name of person with self-employment income|"
     r"payer.?s name|recipient.?s name|trade, business, or aggregation name|"
+    r"schedule c|"
     r"company name|trade name|business name|aggregation name|full name)",
     re.IGNORECASE,
 )
@@ -1015,7 +1017,7 @@ def _classify_widget_value(
     combined_context = f"{lowered_field} {lowered_context}"
     compact_digits = re.sub(r"\D", "", value)
 
-    if "ssn" in pii_types and "table_dependents" in lowered_field and len(compact_digits) == 9:
+    if "ssn" in pii_types and "table_dependents" in lowered_field and len(compact_digits) in {2, 3, 4, 9}:
         return "ssn"
 
     if "ssn" in pii_types and (
